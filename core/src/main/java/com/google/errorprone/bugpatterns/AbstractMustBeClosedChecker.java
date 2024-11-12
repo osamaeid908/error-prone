@@ -47,6 +47,7 @@ import com.google.errorprone.matchers.Description;
 import com.google.errorprone.matchers.Matcher;
 import com.google.errorprone.matchers.UnusedReturnValueMatcher;
 import com.google.errorprone.util.ASTHelpers;
+import com.sun.source.tree.AssignmentTree;
 import com.sun.source.tree.BlockTree;
 import com.sun.source.tree.ConditionalExpressionTree;
 import com.sun.source.tree.ExpressionStatementTree;
@@ -56,6 +57,7 @@ import com.sun.source.tree.MemberSelectTree;
 import com.sun.source.tree.MethodInvocationTree;
 import com.sun.source.tree.MethodTree;
 import com.sun.source.tree.NewClassTree;
+import com.sun.source.tree.ReturnTree;
 import com.sun.source.tree.StatementTree;
 import com.sun.source.tree.Tree;
 import com.sun.source.tree.TryTree;
@@ -112,10 +114,11 @@ public abstract class AbstractMustBeClosedChecker extends BugChecker {
      */
     String suggestName(ExpressionTree tree) {
       String symbolName =
-          switch (tree.getKind()) {
-            case NEW_CLASS ->
-                getSymbol(((NewClassTree) tree).getIdentifier()).getSimpleName().toString();
-            case METHOD_INVOCATION -> getReturnType(tree).asElement().getSimpleName().toString();
+          switch (tree) {
+            case NewClassTree newClassTree ->
+                getSymbol(newClassTree.getIdentifier()).getSimpleName().toString();
+            case MethodInvocationTree methodInvocationTree ->
+                getReturnType(methodInvocationTree).asElement().getSimpleName().toString();
             default -> throw new AssertionError(tree.getKind());
           };
       return uniquifyName(CaseFormat.UPPER_CAMEL.to(CaseFormat.LOWER_CAMEL, symbolName));
@@ -251,76 +254,67 @@ public abstract class AbstractMustBeClosedChecker extends BugChecker {
     while (true) {
       TreePath prev = path;
       path = path.getParentPath();
-      switch (path.getLeaf().getKind()) {
-        case RETURN -> {
-          if (callerMethodTree != null) {
-            // The invocation occurs within a return statement of a method, instead of a lambda
-            // expression or anonymous class.
-            if (HAS_MUST_BE_CLOSED_ANNOTATION.matches(callerMethodTree, state)) {
-              // Ignore invocations of annotated methods and constructors that occur in the return
-              // statement of an annotated caller method, since invocations of the caller are
-              // enforced.
-              return Optional.empty();
-            }
-            // The caller method is not annotated, so the closing of the returned resource is not
-            // enforced. Suggest fixing this by annotating the caller method.
-            return Change.of(
-                SuggestedFix.builder()
-                    .prefixWith(callerMethodTree, "@MustBeClosed\n")
-                    .addImport(MustBeClosed.class.getCanonicalName())
-                    .build());
+      switch (path.getLeaf()) {
+        case ReturnTree unused when callerMethodTree != null -> {
+          // The invocation occurs within a return statement of a method, instead of a lambda
+          // expression or anonymous class.
+          if (HAS_MUST_BE_CLOSED_ANNOTATION.matches(callerMethodTree, state)) {
+            // Ignore invocations of annotated methods and constructors that occur in the return
+            // statement of an annotated caller method, since invocations of the caller are
+            // enforced.
+            return Optional.empty();
           }
+          // The caller method is not annotated, so the closing of the returned resource is not
+          // enforced. Suggest fixing this by annotating the caller method.
+          return Change.of(
+              SuggestedFix.builder()
+                  .prefixWith(callerMethodTree, "@MustBeClosed\n")
+                  .addImport(MustBeClosed.class.getCanonicalName())
+                  .build());
+        }
+        case ReturnTree unused -> {
           // If enclosingMethod returned null, we must be returning from a statement lambda.
           return handleTailPositionInLambda(state);
         }
-        case LAMBDA_EXPRESSION -> {
+        case LambdaExpressionTree unused -> {
           // The method invocation is the body of an expression lambda.
           return handleTailPositionInLambda(state);
         }
-        case CONDITIONAL_EXPRESSION -> {
-          ConditionalExpressionTree conditionalExpressionTree =
-              (ConditionalExpressionTree) path.getLeaf();
-          if (conditionalExpressionTree.getTrueExpression().equals(prev.getLeaf())
-              || conditionalExpressionTree.getFalseExpression().equals(prev.getLeaf())) {
+        case ConditionalExpressionTree conditionalExpressionTree
+            when conditionalExpressionTree.getTrueExpression().equals(prev.getLeaf())
+                || conditionalExpressionTree.getFalseExpression().equals(prev.getLeaf()) -> {
+          continue OUTER;
+        }
+        case MemberSelectTree memberSelectTree
+            when memberSelectTree.getExpression().equals(prev.getLeaf()) -> {
+          Type type = getType(memberSelectTree);
+          Symbol sym = getSymbol(memberSelectTree);
+          Type streamType = state.getTypeFromString(Stream.class.getName());
+          if (isSubtype(sym.enclClass().asType(), streamType, state)
+              && isSameType(type.getReturnType(), streamType, state)) {
+            // skip enclosing method invocation
+            path = path.getParentPath();
             continue OUTER;
           }
         }
-        case MEMBER_SELECT -> {
-          MemberSelectTree memberSelectTree = (MemberSelectTree) path.getLeaf();
-          if (memberSelectTree.getExpression().equals(prev.getLeaf())) {
-            Type type = getType(memberSelectTree);
-            Symbol sym = getSymbol(memberSelectTree);
-            Type streamType = state.getTypeFromString(Stream.class.getName());
-            if (isSubtype(sym.enclClass().asType(), streamType, state)
-                && isSameType(type.getReturnType(), streamType, state)) {
-              // skip enclosing method invocation
-              path = path.getParentPath();
-              continue OUTER;
-            }
+        case NewClassTree newClassTree
+            when isClosingDecorator(newClassTree, prev.getLeaf(), state) -> {
+          if (HAS_MUST_BE_CLOSED_ANNOTATION.matches(newClassTree, state)) {
+            // if the decorator is also annotated then it would already be enforced
+            return Optional.empty();
+          }
+          // otherwise, enforce that the decorator must be closed
+          continue OUTER;
+        }
+        case VariableTree variableTree -> {
+          VarSymbol var = getSymbol(variableTree);
+          if (var.getKind() == ElementKind.RESOURCE_VARIABLE
+              || isClosedInFinallyClause(var, path, state)
+              || ASTHelpers.variableIsStaticFinal(var)) {
+            return Optional.empty();
           }
         }
-        case NEW_CLASS -> {
-          NewClassTree newClassTree = (NewClassTree) path.getLeaf();
-          if (isClosingDecorator(newClassTree, prev.getLeaf(), state)) {
-            if (HAS_MUST_BE_CLOSED_ANNOTATION.matches(newClassTree, state)) {
-              // if the decorator is also annotated then it would already be enforced
-              return Optional.empty();
-            }
-            // otherwise, enforce that the decorator must be closed
-            continue OUTER;
-          }
-        }
-        case VARIABLE -> {
-          Symbol sym = getSymbol(path.getLeaf());
-          if (sym instanceof VarSymbol var) {
-            if (var.getKind() == ElementKind.RESOURCE_VARIABLE
-                || isClosedInFinallyClause(var, path, state)
-                || ASTHelpers.variableIsStaticFinal(var)) {
-              return Optional.empty();
-            }
-          }
-        }
-        case ASSIGNMENT -> {
+        case AssignmentTree unused -> {
           // We shouldn't suggest a try/finally fix when we know the variable is going to be saved
           // for later.
           return findingWithNoFix();
@@ -381,21 +375,15 @@ public abstract class AbstractMustBeClosedChecker extends BugChecker {
     if (!isConsideredFinal(var)) {
       return false;
     }
-    Tree parent = path.getParentPath().getLeaf();
-    if (parent.getKind() != Tree.Kind.BLOCK) {
+    if (!(path.getParentPath().getLeaf() instanceof BlockTree block)) {
       return false;
     }
-    BlockTree block = (BlockTree) parent;
     int idx = block.getStatements().indexOf(path.getLeaf());
     if (idx == -1 || idx == block.getStatements().size() - 1) {
       return false;
     }
     StatementTree next = block.getStatements().get(idx + 1);
-    if (!(next instanceof TryTree)) {
-      return false;
-    }
-    TryTree tryTree = (TryTree) next;
-    if (tryTree.getFinallyBlock() == null) {
+    if (!(next instanceof TryTree tryTree) || tryTree.getFinallyBlock() == null) {
       return false;
     }
     boolean[] closed = {false};
@@ -418,23 +406,16 @@ public abstract class AbstractMustBeClosedChecker extends BugChecker {
 
   private static Optional<Change> chooseFixType(
       ExpressionTree tree, VisitorState state, NameSuggester suggester) {
-    TreePath path = state.getPath();
-    Tree parent = path.getParentPath().getLeaf();
-    if (parent instanceof VariableTree) {
-      return wrapTryFinallyAroundVariableScope((VariableTree) parent, state);
+    if (state.getPath().getParentPath().getLeaf() instanceof VariableTree parent) {
+      return wrapTryFinallyAroundVariableScope(parent, state);
     }
-    StatementTree stmt = state.findEnclosing(StatementTree.class);
-    if (stmt == null) {
-      return Optional.empty();
-    }
-    if (!(stmt instanceof VariableTree)) {
-      return introduceSingleStatementTry(tree, stmt, state, suggester);
-    }
-    VarSymbol varSym = getSymbol((VariableTree) stmt);
-    if (varSym.getKind() == ElementKind.RESOURCE_VARIABLE) {
-      return extractToResourceInCurrentTry(tree, stmt, state, suggester);
-    }
-    return splitVariableDeclarationAroundTry(tree, (VariableTree) stmt, state, suggester);
+    return switch (state.findEnclosing(StatementTree.class)) {
+      case null -> Optional.empty();
+      case VariableTree stmt when getSymbol(stmt).getKind() == ElementKind.RESOURCE_VARIABLE ->
+          extractToResourceInCurrentTry(tree, stmt, state, suggester);
+      case VariableTree stmt -> splitVariableDeclarationAroundTry(tree, stmt, state, suggester);
+      case StatementTree stmt -> introduceSingleStatementTry(tree, stmt, state, suggester);
+    };
   }
 
   private static Optional<Change> introduceSingleStatementTry(
